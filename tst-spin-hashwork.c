@@ -28,7 +28,7 @@
 #define mb() asm volatile("":::"memory")
 
 #define CACHE_ALIGNED __attribute__((aligned(64)))
-#define constant_time 15
+#define constant_time 5
 
 #define NUM_HASHES 1
 
@@ -61,7 +61,6 @@ static void __attribute__((constructor)) init_spin(void)
 struct ops {
  	void *(*test)(void *arg);
  	void (*aggregate)(void **, int);
-	void (*print_thread)(void *res, int);
 } *ops;
 
 #define HASHBUF 20
@@ -69,12 +68,10 @@ u64 hashtime;
 
 struct hashwork_result {
 	unsigned long hashes;
-	unsigned long num;
 };
 
 /* Calibrate single threaded hash work */
 void hashwork_init(void);
-void hashwork_summary(void *r, int cpu);
 void *hashwork(void *arg);
 void hashwork_aggregate(void **r, int num);
 
@@ -394,15 +391,6 @@ static void SHA1_Update(SHA1_CTX* context, const uint8_t* data, const size_t len
     memcpy(&context->buffer[j], &data[i], len - i);
 }
 
-void hashwork_summary(void *r, int cpu)
-{
-	struct hashwork_result *res = r;
-	print_field(cpu, "thread-num");
-	print_field(res->hashes, "hashes");
-	print_field(res->num, "num");
-	puts("");
-}
-
 void *hashwork(void *arg)
 {
 	int i;
@@ -416,7 +404,6 @@ void *hashwork(void *arg)
 	SHA1_CTX ctx;
 
 	res->hashes = 0;
-	res->num = 0;
 
 	memset(buf, 0x1, HASHBUF);
 	SHA1_Init(&ctx);
@@ -435,7 +422,7 @@ void *hashwork(void *arg)
 		wait_a_bit(delay_time_unlocked);
 		num++;
 	}
-	res->num = num;
+	res->hashes = num;
 
 	return res;
 }
@@ -444,15 +431,14 @@ void hashwork_aggregate(void **r, int num)
 {
 	struct hashwork_result **res = (struct hashwork_result **)r;
 	int i;
-	unsigned long hashes = 0, nlocks = 0;
+	unsigned long hashes = 0;
 
 	for (i = 0; i < num; i++) {
 		hashes += res[i]->hashes;
-		nlocks += res[i]->num;
 	}
-	print_field(num, "threads");
-	print_field(hashes/num, "hashes");
-	print_field(nlocks/num, "num");
+	print_field(num, "threads,");
+	print_field(hashes, "total hashes,");
+	print_field(hashes/num, "hashes per thread");
 	puts("");
 }
 
@@ -492,56 +478,32 @@ void test_threads(int numthreads, unsigned long time)
 		mb();
 		stop_flag = 1;
 	}
-
+	
 	for (i = 0; i < numthreads; i++)
 		pthread_join(thr[i], (void *)&res[i]);
 
 	ops->aggregate(res, numthreads);
-
-	for (i = 0; i < numthreads; i++)
-		ops->print_thread(res[i], i);
 }
 
 struct ops hashwork_ops = {
 	.test = hashwork,
 	.aggregate = hashwork_aggregate,
-	.print_thread = hashwork_summary,
 };
 
 struct ops *ops;
 
-static struct option options[] = {
-	{ "thread", 0, NULL, 'n' },
-	{ NULL },
-};
-
 int main(int ac, char **av)
 {
-	int opt;
+	int i;
 	int numthreads = sysconf(_SC_NPROCESSORS_ONLN);
 	ops = &hashwork_ops;
 
 	init_delay();
-
-	while ((opt = getopt_long(ac, av, "n:", options, NULL)) != -1) {
-		switch (opt) {
-		case 'n':
-			if (atoi(optarg) > numthreads) {
-				printf("Please use the number of threads less than %d for testing\n", numthreads);
-				exit(0);
-			}
-			else
-				numthreads = atoi(optarg);
-			break;
-		default:
-			fprintf(stderr, "tst-spin options ...\n"
-				"--thread -n  thread number\n");
-			exit(1);
-		}
-	}
-
-	if (numthreads > 0) 
-		test_threads(numthreads, constant_time);
+	
+	printf("Run hashwork in %d seconds, print statistics below:\n",	constant_time);
+	
+	for (i = 1; i <= numthreads; i++)
+		test_threads(i, constant_time);
 
 	return 0;
 }
