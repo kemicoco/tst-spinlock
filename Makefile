@@ -3,7 +3,7 @@ LIBS := -lpthread -lm -L/home/kemi/git/lib/lib -Wl,-rpath,/home/kemi/git/lib/lib
 
 target:
 	$(CC) $(CFLAGS) -o tst-spin-hashwork tst-spin-hashwork.c $(LIBS)
-	$(CC) $(CFLAGS) -o tst-spin-shared-variable tst-spin-shared-variable.c $(LIBS)
+	$(CC) $(CFLAGS) -o tst-spin-cmpxchg tst-spin-cmpxchg.c $(LIBS)
 
 clean:
-	rm -f tst-spin-hashwork tst-spin-shared-variable 
+	rm -f tst-spin-hashwork tst-spin-cmpxchg 

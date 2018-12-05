@@ -1,50 +1,29 @@
-#define _GNU_SOURCE 1
+#define _GNU_SOURCE
 #include <unistd.h>
 #include <stdio.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdlib.h>
-#include <time.h>
 #include <string.h>
-#include <stdbool.h>
 #include <stdint.h>
 #include <sys/time.h>
-#include <limits.h>
-#include <getopt.h>
-#include <sys/fcntl.h>
+#include <sys/param.h>
 #include <errno.h>
-#include <math.h>
-#include <stdarg.h>
-#include <ctype.h>
+#include <limits.h>
 
-#define u32 unsigned 
-#define u64 unsigned long long
-#define force_inline __attribute__((always_inline))
+#define memory_barrier() __asm ("" ::: "memory")
+#define pause() __asm  ("rep ; nop" ::: "memory")
 
-#define roundup(x,y) (((x) + (y) - 1)  & ~((typeof(x))(y) - 1))
-#define cache_new(ptr) posix_memalign((void **)&(ptr), 64, roundup(sizeof(*(ptr)), 64))
+#define CACHELINE_SIZE	64
+#define CACHE_ALIGNED	__attribute__((aligned(CACHELINE_SIZE)))
 
-#define pause() asm volatile("rep ; nop" ::: "memory")
-#define mb() asm volatile("":::"memory")
-
-#define CACHE_ALIGNED __attribute__((aligned(64)))
-#define constant_time 5
-
-#define NUM_HASHES 1
-
-/* The time consumed by one hash update is about 28ns, tested on 2 sockets
- * SKylake platform
- */
-static int delay_time_unlocked = 150;
-
-struct SHA1_CTX
+struct count
 {
-    uint32_t state[5];
-    uint32_t count[2];
-    uint8_t  buffer[64];
-};
+	unsigned long long total;
+	unsigned long long diff;
+} __attribute__((aligned(128)));
 
-typedef struct SHA1_CTX SHA1_CTX;
+struct count *gcount __attribute__((aligned(128)));
 
 struct {
 	pthread_spinlock_t testlock;
@@ -58,141 +37,58 @@ static void __attribute__((constructor)) init_spin(void)
 	pthread_spin_init(&test.testlock, 0);
 }
 
-struct ops {
- 	void *(*test)(void *arg);
- 	void (*aggregate)(void **, int);
-} *ops;
-
 #define HASHBUF 20
-u64 hashtime;
 
-struct hashwork_result {
-	unsigned long hashes;
+struct SHA1_CTX
+{
+    uint32_t state[5];
+    uint32_t count[2];
+    uint8_t  buffer[64];
 };
 
-/* Calibrate single threaded hash work */
-void hashwork_init(void);
-void *hashwork(void *arg);
-void hashwork_aggregate(void **r, int num);
+typedef struct SHA1_CTX SHA1_CTX;
 
-void test_threads(int numthreads, unsigned long time);
+/* The time consumed by one update is about 200 TSCs.  */
+static int delay_time_unlocked = 600;
 
-#define iterations INT_MAX
+struct ops
+{
+	void *(*test) (void *arg);
+} *ops;
+
+void *work_thread (void *arg);
+
+void test_threads (int numthreads);
+
+#define constant_time 3
+#define iterations LONG_MAX
 
 static volatile int start_thread;
 static volatile int stop_flag;
 
-/* CPU cycles calculation */
-static inline force_inline unsigned long long rdtsc(void)
-{
-#ifdef __i386__
-	u64 s;
-	asm volatile("rdtsc" : "=A" (s) :: "memory");
-	return s;
-#else
-	u32 low, high;
-	asm volatile("rdtsc" : "=a" (low), "=d" (high) :: "memory");
-	return ((u64)high << 32) | low;
-#endif
-}
-
-static inline force_inline unsigned long long rdtscp(void)
-{
-#ifdef DISABLE_RDTSCP
-	return rdtsc();
-#endif
-#ifdef __i386__
-	u64 s;
-	asm volatile("rdtscp" : "=A" (s) :: "ecx", "memory");
-	return s;
-#else
-	u32 low, high;
-	asm volatile("rdtscp" : "=a" (low), "=d" (high) :: "ecx", "memory");
-	return ((u64)high << 32) | low;
-#endif
-}
-
-static FILE *account_fh;
-
-static void __attribute__((constructor)) fh_init(void)
-{
-	account_fh = stdout;
-}
-
-static void print_field(unsigned long num, char *field)
-{
-	fprintf(account_fh, "%lu %s ", num, field);
-}
-
-union pad {
-	double frequency;
-	char pad[64];
-};
-
-static union pad freq __attribute__((aligned(64)));
-#define frequency freq.frequency
-
 /* Delay some fixed time */
-static void delay_ns(unsigned n)
+	static void
+delay_tsc (unsigned n)
 {
-	u64 start = rdtsc();
-	while (rdtsc() < start + (u64)(n * frequency)) {
-		pause();
+	unsigned long long start, current, diff;
+	unsigned int aux;
+	start = __builtin_ia32_rdtscp (&aux);
+	while (1)
+	{
+		current = __builtin_ia32_rdtscp (&aux);
+		diff = current - start;
+		if (diff < n)
+			pause ();
+		else
+			break;
 	}
 }
 
-static void init_delay(void)
-{
-     FILE *f = fopen("/proc/cpuinfo", "r");
-     if (!f)
-	  goto fallback;
-
-     char *line = NULL;
-     size_t linelen = 0;
-     frequency = 0;
-     while (getline(&line, &linelen, f) > 0) {
-	  char unit[10];
-
-	  if (strncmp(line, "model name", sizeof("model name")-1))
-	       continue;
-	  if (sscanf(line + strcspn(line, "@") + 1, "%lf%10s", 
-		     &frequency, unit) == 2) {
-	       if (!strcasecmp(unit, "GHz"))
-		    ;
-	       else if (!strcasecmp(unit, "Mhz"))
-		    frequency *= 1000;
-	       else {
-		    printf("Cannot parse unit %s\n", unit);
-		    goto fallback;
-	       }
-	       break;
-	  }
-     }     
-     free(line);
-     fclose(f);
-     if (frequency) {
-	  return;
-     }
-    
-fallback:
-     f = fopen("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq", "r");
-     int found = 0;
-     if (f) {
-         found = fscanf(f, "%lf", &frequency);
-	 fclose(f);
-     }
-     if (found == 1) {
-         frequency /= 1000000.0;
-         return;
-     }
-     printf("Cannot parse. Using 2Ghz fallback\n");
-     frequency = 2.0; /* 2Ghz likely wrong*/
-}
-
-static void wait_a_bit(int delay_time)
+static void
+wait_a_bit (int delay_time)
 {
 	if (delay_time > 0)
-		delay_ns(delay_time);
+		delay_tsc (delay_time);
 }
 
 /* Hashwork */
@@ -391,119 +287,179 @@ static void SHA1_Update(SHA1_CTX* context, const uint8_t* data, const size_t len
     memcpy(&context->buffer[j], &data[i], len - i);
 }
 
-void *hashwork(void *arg)
+	void *
+work_thread (void *arg)
 {
-	int i;
-	struct hashwork_result *res;
-	if (cache_new(res) != 0) {
-		printf("memory allocation failure, %s\n", strerror(errno));
-		exit(errno);
-	}
-	long num = 0;
+	long i, num = 0;
+	unsigned long pid = (unsigned long) arg;
+	unsigned long long  start, end;
 	char buf[HASHBUF];
 	SHA1_CTX ctx;
 
-	res->hashes = 0;
-
-	memset(buf, 0x1, HASHBUF);
-	SHA1_Init(&ctx);
+	memset (buf, 0x1, HASHBUF);
+	SHA1_Init (&ctx);
 
 	while (!start_thread)
-		pause();
+		pause ();
 
-	for (i = 0; i < iterations && !stop_flag; i++) {
+	unsigned int aux;
+	start = __builtin_ia32_rdtscp (&aux);
+	for (i = 0; stop_flag != 1 && i < iterations; i++)
+	{
 		lock();
-		int j;
-		for (j = 0; j < NUM_HASHES; j++) {
-			SHA1_Update(&ctx, (uint8_t *)buf, HASHBUF);
-			res->hashes++;
-		}
+		SHA1_Update(&ctx, (uint8_t *)buf, HASHBUF);
 		unlock();
-		wait_a_bit(delay_time_unlocked);
+		wait_a_bit (delay_time_unlocked);
 		num++;
 	}
-	res->hashes = num;
+	end = __builtin_ia32_rdtscp (&aux);
+	gcount[pid].diff = end - start;
+	gcount[pid].total = num;
 
-	return res;
+	return NULL;
 }
 
-void hashwork_aggregate(void **r, int num)
-{
-	struct hashwork_result **res = (struct hashwork_result **)r;
-	int i;
-	unsigned long hashes = 0;
-
-	for (i = 0; i < num; i++) {
-		hashes += res[i]->hashes;
-	}
-	print_field(num, "threads,");
-	print_field(hashes, "total hashes,");
-	print_field(hashes/num, "hashes per thread");
-	puts("");
-}
-
-void test_threads(int numthreads, unsigned long time)
+void
+test_threads (int numthreads)
 {
 	start_thread = 0;
 	stop_flag = 0;
-	
-	mb();
+
+	memory_barrier ();
 
 	pthread_t thr[numthreads];
-	void *res[numthreads];
 	int i;
-	for (i = 0; i < numthreads; i++) {
+
+	for (i = 0; i < numthreads; i++)
+	{
 		pthread_attr_t attr;
-		pthread_attr_init(&attr);
+		pthread_attr_init (&attr);
 		cpu_set_t set;
-		CPU_ZERO(&set);
-		(void)CPU_SET(i, &set);
-		pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &set);
-		pthread_create(&thr[i], &attr, 
-			       ops->test,
-			       (void *)(long)i);
+		CPU_ZERO (&set);
+		(void)CPU_SET (i, &set);
+		pthread_attr_setaffinity_np (&attr, sizeof(cpu_set_t), &set);
+		pthread_create (&thr[i], &attr, ops->test, (void *)(long)i);
 	}
 
-	mb();
+	memory_barrier ();
 	start_thread = 1;
-	mb();
-	sched_yield();
+	memory_barrier ();
+	sched_yield ();
 
-	if (time) {
-		struct timespec ts = { 
-			ts.tv_sec = time,
+	if (constant_time) {
+		struct timespec ts = {
+			ts.tv_sec = constant_time,
 			ts.tv_nsec = 0
 		};
-		clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, NULL);
-		mb();
+		clock_nanosleep (CLOCK_MONOTONIC, 0, &ts, NULL);
+		memory_barrier ();
 		stop_flag = 1;
 	}
-	
-	for (i = 0; i < numthreads; i++)
-		pthread_join(thr[i], (void *)&res[i]);
 
-	ops->aggregate(res, numthreads);
+	for (i = 0; i < numthreads; i++)
+		pthread_join (thr[i], NULL);
 }
 
-struct ops hashwork_ops = {
-	.test = hashwork,
-	.aggregate = hashwork_aggregate,
+struct ops hashwork_ops =
+{
+	.test = work_thread,
 };
 
 struct ops *ops;
 
-int main(int ac, char **av)
+	static struct count
+total_stats (int numthreads)
 {
 	int i;
-	int numthreads = sysconf(_SC_NPROCESSORS_ONLN);
+	unsigned long long total = 0;
+
+	memset (gcount, 0, sizeof(gcount[0]) * numthreads);
+
+	unsigned long long start, end, diff;
+	unsigned int aux;
+
+	start = __builtin_ia32_rdtscp (&aux);
+	test_threads (numthreads);
+	end = __builtin_ia32_rdtscp (&aux);
+	diff = end - start;
+
+	for (i = 0; i < numthreads; i++)
+		total += gcount[i].total;
+//	total = get_maximum_value (gcount, numthreads);
+
+	struct count cost = { total, diff };
+	return cost;
+}
+
+static int get_contented_thread_num (int numthreads, struct count *count)
+{
+	int i;
+	struct count res;
+	
+	res = total_stats (1);
+	count->total = res.total;
+	count->diff = res.diff;
+	for (i = 2; i <= numthreads; i++)
+	{
+		res = total_stats (i);
+		if (res.total > count->total) {
+			count->total = res.total;
+			count->diff = res.diff;
+		}
+		else
+			break;
+	}
+
+	return i;
+}
+
+	int
+main (void)
+{
+	int numthreads = sysconf (_SC_NPROCESSORS_ONLN);
+	if (numthreads < 8)
+		return 1;
+
 	ops = &hashwork_ops;
 
-	init_delay();
-	
-	printf("Run hashwork in %d seconds, print statistics below:\n",	constant_time);
-	
-	for (i = 1; i <= numthreads; i++)
-		test_threads(i, constant_time);
+	if (posix_memalign ((void **)&gcount, 4096,
+			sizeof(gcount[0]) * numthreads))
+		exit(-1);
 
+	struct count curr, best;
+	double diff;
+	int i, contention, last = numthreads;
+
+	contention = get_contented_thread_num (numthreads, &best);
+	printf("Best result with thread number: %d, total iterations: %lld\n",
+			contention - 1, best.total);
+
+	for (i = contention; i <= numthreads; i++)
+	{
+		last = i;
+		curr = total_stats (i);
+		diff = best.total - curr.total;
+		/* Skip the case if diff < 0.  */
+		if (diff < 0)
+			continue;
+		diff /= best.total;
+		diff *= 100;
+		printf (" threads number:%4d : %16lld, %0.1f%%\n",
+				i, curr.total, diff);
+		if ((i* 2)< numthreads)
+			i = i * 2;
+		else
+			i = i + 16;
+	}
+
+	if (last != numthreads) {
+		i = numthreads;
+		curr = total_stats (i);
+		diff = best.total - curr.total;
+		diff /= best.total;
+		diff *= 100;
+		printf (" threads number:%4d : %16lld, %0.1f%%\n",
+			i, curr.total, diff);
+	}
 	return 0;
 }
