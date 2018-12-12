@@ -10,19 +10,14 @@
 #include <stdint.h>
 #include <sys/time.h>
 #include <limits.h>
-#include <getopt.h>
-#include <sys/fcntl.h>
 #include <errno.h>
 #include <math.h>
-#include <stdarg.h>
-#include <ctype.h>
 
-#define u32 unsigned 
-#define u64 unsigned long long
 #define force_inline __attribute__((always_inline))
 
 #define roundup(x,y) (((x) + (y) - 1)  & ~((typeof(x))(y) - 1))
 #define cache_new(ptr) posix_memalign((void **)&(ptr), 64, roundup(sizeof(*(ptr)), 64))
+#define array_size(array) sizeof(array)/sizeof(array[0]) 
 
 #define pause() asm volatile("rep ; nop" ::: "memory")
 #define mb() asm volatile("":::"memory")
@@ -30,12 +25,9 @@
 #define CACHE_ALIGNED __attribute__((aligned(64)))
 #define constant_time 5
 
-#define NUM_HASHES 1
-
-/* The time consumed by one hash update is about 28ns, tested on 2 sockets
- * SKylake platform
- */
-static int delay_time_unlocked = 250;
+int sys_numthreads;
+int nums;
+int workset[4] = {1, 5, 10, 20};
 
 struct SHA1_CTX
 {
@@ -46,6 +38,15 @@ struct SHA1_CTX
 
 typedef struct SHA1_CTX SHA1_CTX;
 
+#define PTHREAD_SPINLOCK 1
+#define PTHREAD_ADAPTIVE_MUTEX 2
+#define PTHREAD_QUEUESPINNER_MUTEX 3
+
+#ifndef LOCK_TYPE
+#define LOCK_TYPE PTHREAD_SPINLOCK
+#endif
+
+#if LOCK_TYPE == PTHREAD_SPINLOCK
 struct {
 	pthread_spinlock_t testlock;
 	char pad[64];
@@ -57,6 +58,31 @@ static void __attribute__((constructor)) init_spin(void)
 {
 	pthread_spin_init(&test.testlock, 0);
 }
+#endif
+
+#if LOCK_TYPE == PTHREAD_ADAPTIVE_MUTEX
+struct {
+	pthread_mutex_t testlock;
+	char pad[64];
+} test CACHE_ALIGNED = {
+	.testlock = PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP
+};
+
+#define lock() pthread_mutex_lock(&test.testlock)
+#define unlock() pthread_mutex_unlock(&test.testlock)
+#endif
+
+#if LOCK_TYPE == PTHREAD_QUEUESPINNER_MUTEX
+struct {
+	pthread_mutex_t testlock;
+	char pad[64];
+} test CACHE_ALIGNED = {
+	.testlock = PTHREAD_QUEUESPINNER_MUTEX_INITIALIZER_NP
+};
+
+#define lock() pthread_mutex_lock(&test.testlock)
+#define unlock() pthread_mutex_unlock(&test.testlock)
+#endif
 
 struct ops {
  	void *(*test)(void *arg);
@@ -64,7 +90,7 @@ struct ops {
 } *ops;
 
 #define HASHBUF 20
-u64 hashtime;
+unsigned long long hashtime;
 
 struct hashwork_result {
 	unsigned long hashes;
@@ -75,217 +101,51 @@ void hashwork_init(void);
 void *hashwork(void *arg);
 void hashwork_aggregate(void **r, int num);
 
-void test_threads(int numthreads, unsigned long time);
+void test_threads(int numthreads);
 
 #define iterations INT_MAX
 
 static volatile int start_thread;
 static volatile int stop_flag;
 
-/* CPU cycles calculation */
-static inline force_inline unsigned long long rdtsc(void)
+/* Delay some fixed time.  */
+static inline void delay_tsc (unsigned long n)
 {
-#ifdef __i386__
-	u64 s;
-	asm volatile("rdtsc" : "=A" (s) :: "memory");
-	return s;
-#else
-	u32 low, high;
-	asm volatile("rdtsc" : "=a" (low), "=d" (high) :: "memory");
-	return ((u64)high << 32) | low;
-#endif
-}
-
-static inline force_inline unsigned long long rdtscp(void)
-{
-#ifdef DISABLE_RDTSCP
-	return rdtsc();
-#endif
-#ifdef __i386__
-	u64 s;
-	asm volatile("rdtscp" : "=A" (s) :: "ecx", "memory");
-	return s;
-#else
-	u32 low, high;
-	asm volatile("rdtscp" : "=a" (low), "=d" (high) :: "ecx", "memory");
-	return ((u64)high << 32) | low;
-#endif
-}
-
-static FILE *account_fh;
-
-static void __attribute__((constructor)) fh_init(void)
-{
-	account_fh = stdout;
-}
-
-static void print_field(unsigned long num, char *field)
-{
-	fprintf(account_fh, "%lu %s ", num, field);
-}
-
-union pad {
-	double frequency;
-	char pad[64];
-};
-
-static union pad freq __attribute__((aligned(64)));
-#define frequency freq.frequency
-
-/* Delay some fixed time */
-static void delay_ns(unsigned n)
-{
-	u64 start = rdtsc();
-	while (rdtsc() < start + (u64)(n * frequency)) {
-		pause();
+	unsigned long long start, current, diff;
+	unsigned int aux;
+	start = __builtin_ia32_rdtscp (&aux);
+	while (1)
+	{
+		current = __builtin_ia32_rdtscp (&aux);
+		diff = current - start;
+		if (diff < n)
+			pause ();
+		else
+			break;
 	}
 }
 
-static void init_delay(void)
-{
-     FILE *f = fopen("/proc/cpuinfo", "r");
-     if (!f)
-	  goto fallback;
-
-     char *line = NULL;
-     size_t linelen = 0;
-     frequency = 0;
-     while (getline(&line, &linelen, f) > 0) {
-	  char unit[10];
-
-	  if (strncmp(line, "model name", sizeof("model name")-1))
-	       continue;
-	  if (sscanf(line + strcspn(line, "@") + 1, "%lf%10s", 
-		     &frequency, unit) == 2) {
-	       if (!strcasecmp(unit, "GHz"))
-		    ;
-	       else if (!strcasecmp(unit, "Mhz"))
-		    frequency *= 1000;
-	       else {
-		    printf("Cannot parse unit %s\n", unit);
-		    goto fallback;
-	       }
-	       break;
-	  }
-     }     
-     free(line);
-     fclose(f);
-     if (frequency) {
-	  return;
-     }
-    
-fallback:
-     f = fopen("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq", "r");
-     int found = 0;
-     if (f) {
-         found = fscanf(f, "%lf", &frequency);
-	 fclose(f);
-     }
-     if (found == 1) {
-         frequency /= 1000000.0;
-         return;
-     }
-     printf("Cannot parse. Using 2Ghz fallback\n");
-     frequency = 2.0; /* 2Ghz likely wrong*/
-}
-
-static void wait_a_bit(int delay_time)
+static inline void wait_a_bit(int delay_time)
 {
 	if (delay_time > 0)
-		delay_ns(delay_time);
+		delay_tsc (delay_time);
+}
+
+/* Each iteration of hashwork is about 250 TSCs.  */
+static inline void wait_random_time ()
+{
+	wait_a_bit ((rand() % 100) * 20 * nums);
 }
 
 /* Hashwork */
-/*
-SHA-1 in C
-By Steve Reid <sreid@sea-to-sky.net>
-100% Public Domain
-
------------------
-Modified 7/98
-By James H. Brown <jbrown@burgoyne.com>
-Still 100% Public Domain
-
-Corrected a problem which generated improper hash values on 16 bit machines
-Routine SHA1Update changed from
-  void SHA1Update(SHA1_CTX* context, unsigned char* data, unsigned int
-len)
-to
-  void SHA1Update(SHA1_CTX* context, unsigned char* data, unsigned
-long len)
-
-The 'len' parameter was declared an int which works fine on 32 bit machines.
-However, on 16 bit machines an int is too small for the shifts being done
-against
-it.  This caused the hash function to generate incorrect values if len was
-greater than 8191 (8K - 1) due to the 'len << 3' on line 3 of SHA1Update().
-
-Since the file IO in main() reads 16K at a time, any file 8K or larger would
-be guaranteed to generate the wrong hash (e.g. Test Vector #3, a million
-"a"s).
-
-I also changed the declaration of variables i & j in SHA1Update to
-unsigned long from unsigned int for the same reason.
-
-These changes should make no difference to any 32 bit implementations since
-an
-int and a long are the same size in those environments.
-
---
-I also corrected a few compiler warnings generated by Borland C.
-1. Added #include <process.h> for exit() prototype
-2. Removed unused variable 'j' in SHA1Final
-3. Changed exit(0) to return(0) at end of main.
-
-ALL changes I made can be located by searching for comments containing 'JHB'
------------------
-Modified 8/98
-By Steve Reid <sreid@sea-to-sky.net>
-Still 100% public domain
-
-1- Removed #include <process.h> and used return() instead of exit()
-2- Fixed overwriting of finalcount in SHA1Final() (discovered by Chris Hall)
-3- Changed email address from steve@edmweb.com to sreid@sea-to-sky.net
-
------------------
-Modified 4/01
-By Saul Kravitz <Saul.Kravitz@celera.com>
-Still 100% PD
-Modified to run on Compaq Alpha hardware.
-
------------------
-Modified 07/2002
-By Ralph Giles <giles@ghostscript.com>
-Still 100% public domain
-modified for use with stdint types, autoconf
-code cleanup, removed attribution comments
-switched SHA1Final() argument order for consistency
-use SHA1_ prefix for public api
-move public api to sha1.h
-*/
-
-/*
-Test Vectors (from FIPS PUB 180-1)
-"abc"
-  A9993E36 4706816A BA3E2571 7850C26C 9CD0D89D
-"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
-  84983E44 1C3BD26E BAAE4AA1 F95129E5 E54670F1
-A million repetitions of "a"
-  34AA973C D4C4DAA4 F61EEB2B DBAD2731 6534016F
-*/
-
-/* public api for steve reid's public domain SHA-1 implementation */
-/* this file is in the public domain */
+/* SHA-1 in C
+   By Steve Reid <sreid@sea-to-sky.net> 100% Public Domain.  */
 
 #define rol rotl32
 static inline __attribute__((always_inline)) uint32_t rotl32 ( uint32_t x, int8_t r )
 {
-	  return (x << r) | (x >> (32 - r));
+	return (x << r) | (x >> (32 - r));
 }
-/* blk0() and blk() perform the initial expand. */
-/* I got the idea of expanding during the round function from SSLeay */
-/* FIXME: can we do this in an endian-proof way? */
-
 #ifdef WORDS_BIGENDIAN
 #define blk0(i) block->l[i]
 #else
@@ -391,9 +251,31 @@ static void SHA1_Update(SHA1_CTX* context, const uint8_t* data, const size_t len
     memcpy(&context->buffer[j], &data[i], len - i);
 }
 
+/*void hashwork_init(void)
+{
+	char buf[HASHBUF];
+	SHA1_CTX ctx;
+
+	memset(buf, 0x1, HASHBUF);
+	SHA1_Init(&ctx);
+
+	int i;
+	unsigned int aux;
+	for (i = 0; i < 10; i++)
+		SHA1_Update(&ctx, (uint8_t *)buf, HASHBUF);
+	unsigned long long a = __builtin_ia32_rdtscp(&aux);
+	for (i = 0; i < 10000; i++) {
+		SHA1_Update(&ctx, (uint8_t *)buf, HASHBUF);
+	}
+	unsigned long long b = __builtin_ia32_rdtscp(&aux);
+	hashtime = (b-a) / 10000;
+	printf("hashtime:%llu TSCs\n", hashtime);
+}
+*/
+
 void *hashwork(void *arg)
 {
-	int i;
+	int i, j;
 	struct hashwork_result *res;
 	if (cache_new(res) != 0) {
 		printf("memory allocation failure, %s\n", strerror(errno));
@@ -413,13 +295,10 @@ void *hashwork(void *arg)
 
 	for (i = 0; i < iterations && !stop_flag; i++) {
 		lock();
-		int j;
-		for (j = 0; j < NUM_HASHES; j++) {
+		for (j = 0; j < nums; j++)
 			SHA1_Update(&ctx, (uint8_t *)buf, HASHBUF);
-			res->hashes++;
-		}
 		unlock();
-		wait_a_bit(delay_time_unlocked);
+		wait_random_time ();
 		num++;
 	}
 	res->hashes = num;
@@ -436,12 +315,10 @@ void hashwork_aggregate(void **r, int num)
 	for (i = 0; i < num; i++) {
 		hashes += res[i]->hashes;
 	}
-	print_field(num, "threads,");
-	print_field(hashes, "total hashes,");
-	puts("");
+	printf("%d threads, total iterations: %lu\n", num, hashes);
 }
 
-void test_threads(int numthreads, unsigned long time)
+void test_threads(int numthreads)
 {
 	start_thread = 0;
 	stop_flag = 0;
@@ -456,7 +333,7 @@ void test_threads(int numthreads, unsigned long time)
 		pthread_attr_init(&attr);
 		cpu_set_t set;
 		CPU_ZERO(&set);
-		(void)CPU_SET(i, &set);
+		(void)CPU_SET(i % sys_numthreads, &set);
 		pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &set);
 		pthread_create(&thr[i], &attr, 
 			       ops->test,
@@ -468,18 +345,16 @@ void test_threads(int numthreads, unsigned long time)
 	mb();
 	sched_yield();
 
-	if (time) {
-		struct timespec ts = { 
-			ts.tv_sec = time,
-			ts.tv_nsec = 0
-		};
-		clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, NULL);
-		mb();
-		stop_flag = 1;
-	}
+	struct timespec ts = { 
+		ts.tv_sec = constant_time,
+		ts.tv_nsec = 0
+	};
+	clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, NULL);
+	mb();
+	stop_flag = 1;
 	
 	for (i = 0; i < numthreads; i++)
-		pthread_join(thr[i], (void *)&res[i]);
+		pthread_join(thr[i], (void **)&res[i]);
 
 	ops->aggregate(res, numthreads);
 }
@@ -493,23 +368,26 @@ struct ops *ops;
 
 int main(int ac, char **av)
 {
-	int i;
-	int numthreads = sysconf(_SC_NPROCESSORS_ONLN);
+	int i, j;
+	sys_numthreads = sysconf(_SC_NPROCESSORS_ONLN);
 	ops = &hashwork_ops;
 
-	init_delay();
-	
-	printf("Run hashwork in %d seconds, print statistics below:\n",	constant_time);
-	
-	for (i = 1; i < numthreads;)
+	for (j = 0; j < array_size(workset); j++)
 	{
-		test_threads(i, constant_time);
+		printf("Run hashwork in %d seconds with %dx worksize, print total \
+iterations below:\n", constant_time, workset[j]);
+		nums = workset[j];
+	for (i = 1; i < sys_numthreads;)
+	{
+		test_threads(i);
 		if (i > 6)
 			i += i;
 		else
 			i++;
 	}
 
-	test_threads(numthreads, constant_time);
+	test_threads(sys_numthreads);
+	test_threads(4 * sys_numthreads);
+	}
 	return 0;
 }
